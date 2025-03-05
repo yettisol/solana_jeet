@@ -1,15 +1,23 @@
 import os
 import asyncio
+import base58
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from solana.rpc.api import Client
 from solders.signature import Signature
+import logging
+
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = "7570294416:AAHK0Utk--AEfXYyP1NLaxYeIJV6Gagd3Ps"
 PAYMENT_ADDRESS = "8ecQdrWxKxnh1UzwRk1sFaWv7q8CeMJfWh1M732iZtba"
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 
-# Solana RPC endpoint (public, replace with private for production)
 RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 solana_client = Client(RPC_ENDPOINT)
 
@@ -24,6 +32,7 @@ BOOST_VOLUME_STATE = 'BOOST_VOLUME'
 TOKEN_ADDRESS_STATE = 'TOKEN_ADDRESS'
 PAYMENT_STATE = 'PAYMENT'
 WALLET_MANAGEMENT_STATE = 'WALLET_MANAGEMENT'
+WALLET_IMPORT_STATE = 'WALLET_IMPORT'
 
 # User data storage (in-memory for this example)
 user_data = {}
@@ -43,6 +52,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     user_id = query.from_user.id
+    
+    logger.info(f"Button clicked: {data}")
     
     if data == "volume_booster":
         keyboard = [
@@ -92,6 +103,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = update.message.text
     
+    logger.info(f"Text received: {text}")
+    
     if user_id in user_data and user_data[user_id].get('state') == TOKEN_ADDRESS_STATE:
         if len(text) == 44 and text.isalnum():
             user_data[user_id]['token_address'] = text
@@ -99,7 +112,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard = [
                 [InlineKeyboardButton("Proceed to Payment 💸", callback_data="payment")],
-                [InlineKeyboardButton("Wallet Options 💰", callback_data="wallets_menu")],
+                [InlineKeyboardButton("Import Wallets 💰", callback_data="import_wallets")],
                 [InlineKeyboardButton("🔙 Go Back", callback_data="volume_booster")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -113,9 +126,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
     elif user_id in user_data and user_data[user_id].get('state') == PAYMENT_STATE:
-        # Handle transaction hash
         tx_signature = text
         await verify_payment(update, context, user_id, tx_signature)
+        
+    elif user_id in user_data and user_data[user_id].get('state') == WALLET_IMPORT_STATE:
+        try:
+            private_keys = text.strip().split('\n')
+            wallets = []
+            for key in private_keys:
+                if key:
+                    # Basic validation: check if it’s a plausible base58 private key
+                    try:
+                        decoded_key = base58.b58decode(key.strip())
+                        if len(decoded_key) != 64:  # Solana private keys are 64 bytes
+                            raise ValueError(f"Invalid private key length for {key[:10]}...")
+                        # We’ll store as string for now, avoiding Keypair import issues
+                        wallets.append({'private_key': key.strip()})
+                    except Exception as e:
+                        raise ValueError(f"Invalid base58 private key: {str(e)}")
+            if not wallets:
+                raise ValueError("No valid private keys provided!")
+            user_data[user_id]['wallets'] = wallets
+            wallet_info = f"✅ Successfully imported {len(wallets)} wallets!\n"
+            wallet_info += (
+                "Wallets will be used for volume boosting.\n"
+                "⚠️ SECURITY WARNING: Delete this message to protect your private keys!\n"
+                "Starting volume boost with these wallets..."
+            )
+            await update.message.reply_text(wallet_info)
+            await initiate_volume_boost(update, context, user_id)
+        except Exception as e:
+            logger.error(f"Error importing wallets: {str(e)}")
+            await update.message.reply_text(
+                f"❌ Error importing wallets: {str(e)}\n"
+                "Please ensure keys are valid base58-encoded private keys (one per line)."
+            )
 
 async def payment_or_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -126,6 +171,8 @@ async def payment_or_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     user_id = query.from_user.id
     data = query.data
+    
+    logger.info(f"Payment/Wallets clicked: {data}")
     
     if data == "payment":
         if user_id in user_data and 'token_address' in user_data[user_id]:
@@ -141,18 +188,20 @@ async def payment_or_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             await query.edit_message_text("Error: No token address set!")
             
-    elif data == "wallets_menu":
-        await query.edit_message_text("ℹ️ Wallet options are under construction!")
+    elif data == "import_wallets":
+        user_data[user_id]['state'] = WALLET_IMPORT_STATE
+        await query.edit_message_text(
+            text="Please paste your private keys (one per line) to import your wallets.\n"
+                 "Ensure each wallet has at least 0.010 SOL for boosting:\n"
+                 "⚠️ SECURITY WARNING: Delete this message after sending to protect your keys!"
+        )
 
 async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, tx_signature: str):
     """
     Verify the payment transaction and proceed to wallet management
     """
     try:
-        # Wait for transaction propagation
         await asyncio.sleep(5)
-        
-        # Fetch transaction with base58 encoding for reliability
         tx_info = solana_client.get_transaction(Signature.from_string(tx_signature), encoding="base58")
         if not tx_info.value:
             await update.message.reply_text("❌ Transaction not found. It may still be processing. Please try again in a few seconds.")
@@ -162,7 +211,6 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, use
             await update.message.reply_text("❌ Transaction failed according to the blockchain.")
             return
         
-        # Extract transaction details
         tx = tx_info.value.transaction.transaction
         message = tx.message
         account_keys = [str(key) for key in message.account_keys]
@@ -170,22 +218,19 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         payment_valid = False
         amount_sent = 0
         
-        # Check instructions for System Program transfer
-        SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
         for instruction in message.instructions:
             program_id_index = instruction.program_id_index
             program_id = account_keys[program_id_index]
             
             if program_id == SYSTEM_PROGRAM_ID:
                 if len(instruction.accounts) >= 2:
-                    dest_index = instruction.accounts[1]  # Destination account
+                    dest_index = instruction.accounts[1]
                     dest_pubkey = account_keys[dest_index]
                     
                     if dest_pubkey == PAYMENT_ADDRESS:
-                        # Parse transfer instruction data (System Program transfer: 4 bytes instruction type, 8 bytes lamports)
-                        if len(instruction.data) >= 12 and instruction.data[0:4] == bytes([2, 0, 0, 0]):  # Transfer instruction ID
+                        if len(instruction.data) >= 12 and instruction.data[0:4] == bytes([2, 0, 0, 0]):
                             lamports = int.from_bytes(instruction.data[4:12], byteorder='little')
-                            amount_sent = lamports / 1_000_000_000  # Convert to SOL
+                            amount_sent = lamports / 1_000_000_000
                             if amount_sent >= 0.010:
                                 payment_valid = True
                                 break
@@ -200,7 +245,6 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, use
             )
             await manage_wallets(update, context, user_id)
         else:
-            # Detailed feedback
             if PAYMENT_ADDRESS in account_keys:
                 pre_balances = tx_info.value.transaction.meta.pre_balances
                 post_balances = tx_info.value.transaction.meta.post_balances
@@ -223,27 +267,73 @@ async def verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 
 async def manage_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """
-    Placeholder for wallet management after payment verification
+    Manage wallets by prompting for import
     """
     provider = user_data[user_id]['provider']
     token_address = user_data[user_id]['token_address']
     payment_amount = user_data[user_id]['payment_amount']
     
+    keyboard = [
+        [InlineKeyboardButton("Import Your Wallets", callback_data="import_wallets")],
+        [InlineKeyboardButton("🔙 Go Back", callback_data="volume_booster")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    logger.info(f"Showing wallet import option for user {user_id}")
+    
     await update.message.reply_text(
         f"Wallet Management for {provider.capitalize()} Volume Boost\n"
         f"Token: {token_address}\n"
         f"Payment: {payment_amount:.3f} SOL\n"
-        "ℹ️ Wallet generation/import and volume boosting logic to be implemented here."
+        "Please import your wallets to proceed with volume boosting:",
+        reply_markup=reply_markup
     )
+
+async def initiate_volume_boost(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """
+    Simulate volume boost with imported wallets
+    """
+    provider = user_data[user_id]['provider']
+    token_address = user_data[user_id]['token_address']
+    wallets = user_data[user_id].get('wallets', [])
+    
+    if not wallets:
+        await update.message.reply_text("❌ No wallets available for boosting!")
+        return
+    
+    if len(wallets) < 2:
+        await update.message.reply_text("❌ At least 2 wallets are required for volume boosting!")
+        return
+    
+    await update.message.reply_text(
+        f"Starting volume boost on {provider.capitalize()} for token: {token_address}\n"
+        f"Using {len(wallets)} wallets..."
+    )
+    
+    await update.message.reply_text(
+        f"🎉 Volume boost simulation completed on {provider.capitalize()}!\n"
+        f"Token: {token_address}\n"
+        "Note: Actual boosting requires pool-specific integration."
+    )
+    if user_id in user_data:
+        del user_data[user_id]
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors caused by updates."""
+    logger.error('Update "%s" caused error "%s"', update, context.error)
+    if update and update.message:
+        await update.message.reply_text(f"❌ An error occurred: {str(context.error)}")
 
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_click, pattern="^(volume_booster|main|wallets|support|raydium|meteora|pumpfun|moonshot)$"))
-    application.add_handler(CallbackQueryHandler(payment_or_wallets, pattern="^(payment|wallets_menu)$"))
+    application.add_handler(CallbackQueryHandler(payment_or_wallets, pattern="^(payment|import_wallets)$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_error_handler(error_handler)
     
+    logger.info("Bot started!")
     application.run_polling()
 
 if __name__ == "__main__":
